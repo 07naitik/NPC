@@ -5,3 +5,5 @@ matplotlib
 seaborn
 plotly
 altair
+scipy
+psycopg2-binary
