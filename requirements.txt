@@ -7,3 +7,4 @@ plotly
 altair
 scipy
 psycopg2-binary
+python-dotenv
