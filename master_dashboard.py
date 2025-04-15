@@ -3,12 +3,15 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+from plotly.subplots import make_subplots
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 import math
+import concurrent.futures
+import time
 
 # Set page title and layout
 st.set_page_config(page_title="LP Strategy Optimizer", layout="wide")
@@ -521,7 +524,10 @@ def calculate_V(P, P0, L, t):
 def rebalance_lp_position(price, lp_position):
     """
     Rebalance LP position when price moves outside the specified range.
+    Returns the updated position and whether a rebalance occurred.
     """
+    rebalanced = False
+    
     if (price < lp_position['p_lower_rebalance'] or 
         price > lp_position['p_upper_rebalance']):
         
@@ -533,12 +539,14 @@ def rebalance_lp_position(price, lp_position):
         lp_position['p_lower_rebalance'] = lp_position['p_lower'] * (1.0001 ** (lp_position['num_ticks'] * lp_position['imbalance'] * 2))
         lp_position['p_upper_rebalance'] = lp_position['p_upper'] * (1.0001 ** (-lp_position['num_ticks'] * lp_position['imbalance'] * 2))
         lp_position['L'] = calculate_L(lp_position['value'], lp_position['p_0'], lp_position['num_ticks'])
+        rebalanced = True
         
-    return lp_position
+    return lp_position, rebalanced
 
 def simulate_lp_value(price_path, V, t, imbalance, fee_rate):
     """
     Simulate LP value over time based on a price path.
+    Returns the simulation results and the number of rebalances.
     """
     lp_position = {}
     lp_position['value'] = V
@@ -554,6 +562,7 @@ def simulate_lp_value(price_path, V, t, imbalance, fee_rate):
     lp_position['fee_rate'] = fee_rate
     
     simulation = pd.DataFrame([lp_position])
+    rebalance_count = 0
     
     for time_step in price_path:
         lp_position['value'] = calculate_V(price_path[time_step], 
@@ -563,23 +572,53 @@ def simulate_lp_value(price_path, V, t, imbalance, fee_rate):
         
         lp_position['price'] = price_path[time_step]
         
-        lp_position = rebalance_lp_position(price_path[time_step], lp_position)
+        lp_position, rebalanced = rebalance_lp_position(price_path[time_step], lp_position)
+        if rebalanced:
+            rebalance_count += 1
         
         new_row = pd.DataFrame([lp_position])
         simulation = pd.concat([simulation, new_row], ignore_index=True)
     
-    return simulation
+    return simulation, rebalance_count
+
+def simulate_single_path(path_index, price_path_params, tick_spacings, initial_value, imbalance, fee_rate, N):
+    """
+    Helper function to simulate a single price path for all range widths.
+    This function is designed to be used with parallel processing.
+    """
+    # Generate price path
+    T, mu, sigma = price_path_params
+    dt = T / N
+    price_path = return_price_path(T, N, dt, mu, sigma)
+    
+    # Initialize results for this path
+    results = np.zeros(len(tick_spacings))
+    rebalance_counts = np.zeros(len(tick_spacings))
+    
+    # Run simulation for each tick spacing
+    for j, spacing in enumerate(tick_spacings):
+        sim_result, rebalance_count = simulate_lp_value(price_path, initial_value, spacing, imbalance, fee_rate)
+        
+        # Store change in liquidity constant (L) as a percentage
+        results[j] = 100 * (sim_result.at[N, 'L']/sim_result.at[0, 'L'] - 1)
+        
+        # Store rebalance count
+        rebalance_counts[j] = rebalance_count
+    
+    return results, rebalance_counts
 
 def run_lp_simulations(sigma, num_price_paths=10, initial_value=1000, 
                      imbalance=0.10, fee_rate=0.00, projected_daily_fee_pct=0.04):
     """
     Run multiple LP simulations with fixed percentage-based range widths.
+    Uses parallel processing to speed up simulations.
     """
     # Set simulation parameters
     T = 1.0/365  # 1 day
     N = 1440     # Number of time steps (1-minute intervals)
     dt = T / N   # Time step
     mu = 0.00    # Expected annual return (drift)
+    price_path_params = (T, mu, sigma)
     
     # Define the range widths in percentage (one-sided)
     # These will be +/- the percentage (so the total width is 2x these values)
@@ -592,26 +631,46 @@ def run_lp_simulations(sigma, num_price_paths=10, initial_value=1000,
     # Array to store results
     num_widths = len(range_widths_pct)
     results = np.zeros((num_price_paths, num_widths))
+    rebalance_counts = np.zeros((num_price_paths, num_widths))
     
     with st.spinner(f"Running {num_price_paths} simulations for {num_widths} different range widths..."):
+        # Show time estimate
+        start_time = time.time()
+        
         progress_bar = st.progress(0)
         
-        # Run simulations
-        for i in range(num_price_paths):
-            price_path = return_price_path(T, N, dt, mu, sigma)
+        # Run simulations in parallel
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            # Submit tasks for each price path
+            futures = [
+                executor.submit(
+                    simulate_single_path, 
+                    i, 
+                    price_path_params, 
+                    tick_spacings, 
+                    initial_value, 
+                    imbalance, 
+                    fee_rate, 
+                    N
+                ) for i in range(num_price_paths)
+            ]
             
-            for j in range(num_widths):
-                spacing = tick_spacings[j]
-                sim_result = simulate_lp_value(price_path, initial_value, spacing, imbalance, fee_rate)
+            # Process results as they complete
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                path_results, path_rebalances = future.result()
+                results[i] = path_results
+                rebalance_counts[i] = path_rebalances
                 
-                # Store change in liquidity constant (L) as a percentage
-                results[i][j] = 100 * (sim_result.at[N, 'L']/sim_result.at[0, 'L'] - 1)
-            
-            # Update progress
-            progress_bar.progress((i + 1) / num_price_paths)
+                # Update progress
+                progress_bar.progress((i + 1) / num_price_paths)
+        
+        # Show time taken
+        end_time = time.time()
+        st.success(f"Simulations completed in {end_time - start_time:.2f} seconds")
     
     # Calculate average results
     avg_results = np.mean(results, axis=0)
+    avg_rebalances = np.mean(rebalance_counts, axis=0)
     
     # Calculate total width in percentage terms (double the one-sided width)
     total_width_pcts = [width_pct * 2 for width_pct in range_widths_pct]
@@ -637,7 +696,8 @@ def run_lp_simulations(sigma, num_price_paths=10, initial_value=1000,
         'Tick Spacing': tick_spacings,
         'Impermanent Loss (%)': avg_results,
         'Projected Fees (%)': projected_fees,
-        'Net Return (%)': net_returns
+        'Net Return (%)': net_returns,
+        'Expected Daily Rebalances': avg_rebalances
     })
     
     return results_df, optimal_width_pct, optimal_tick_spacing
@@ -787,8 +847,11 @@ if run_analysis:
     # Plot results using Plotly
     st.write("LP Performance vs Range Width")
     
-    # Create Plotly figure
+    # Create Plotly figure with subplots
     fig = go.Figure()
+    
+    # Create a secondary y-axis for rebalances
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
     
     # Add traces for each metric
     fig.add_trace(go.Scatter(
@@ -797,7 +860,7 @@ if run_analysis:
         mode='lines',
         name='Impermanent Loss',
         line=dict(color='red', dash='dash')
-    ))
+    ), secondary_y=False)
     
     fig.add_trace(go.Scatter(
         x=results_df['Total Width (%)'],
@@ -805,7 +868,7 @@ if run_analysis:
         mode='lines',
         name='Projected Fees',
         line=dict(color='green', dash='dash')
-    ))
+    ), secondary_y=False)
     
     fig.add_trace(go.Scatter(
         x=results_df['Total Width (%)'],
@@ -813,7 +876,17 @@ if run_analysis:
         mode='lines',
         name='Net Return',
         line=dict(color='blue', width=3)
-    ))
+    ), secondary_y=False)
+    
+    # Add rebalances on secondary y-axis
+    fig.add_trace(go.Scatter(
+        x=results_df['Total Width (%)'],
+        y=results_df['Expected Daily Rebalances'],
+        mode='lines+markers',
+        name='Expected Rebalances',
+        line=dict(color='purple', dash='dot'),
+        marker=dict(size=7)
+    ), secondary_y=True)
     
     # Highlight optimal point
     optimal_row = results_df[results_df['Range Width (±%)'] == optimal_width_pct].iloc[0]
@@ -827,14 +900,13 @@ if run_analysis:
         name=f'Optimal: ±{optimal_width_pct}% range',
         marker=dict(color='green', size=15),
         hoverinfo='text',
-        hovertext=f'Optimal Width: ±{optimal_width_pct}%<br>Total Width: {optimal_width}%<br>Return: {optimal_return:.2f}%'
-    ))
+        hovertext=f'Optimal Width: ±{optimal_width_pct}%<br>Total Width: {optimal_width}%<br>Return: {optimal_return:.2f}%<br>Rebalances: {optimal_row["Expected Daily Rebalances"]:.1f}/day'
+    ), secondary_y=False)
     
     # Update layout
     fig.update_layout(
         title=f'LP Performance Analysis for {trading_pair}',
         xaxis_title='Total Range Width (%)',
-        yaxis_title='Return (%)',
         height=600,
         hovermode='closest',
         legend=dict(
@@ -845,13 +917,17 @@ if run_analysis:
         )
     )
     
+    # Set y-axis titles
+    fig.update_yaxes(title_text="Return (%)", secondary_y=False)
+    fig.update_yaxes(title_text="Daily Rebalances", secondary_y=True)
+    
     # Add a note explaining the chart
     fig.add_annotation(
         x=0.5,
         y=-0.15,
         xref="paper",
         yref="paper",
-        text="Wider ranges have less impermanent loss but earn fewer fees.<br>Narrower ranges earn more fees but risk more impermanent loss.",
+        text="Wider ranges have less impermanent loss but earn fewer fees.<br>Narrower ranges earn more fees but risk more impermanent loss and frequent rebalancing.",
         showarrow=False,
         font=dict(size=12),
         align="center",
@@ -864,7 +940,7 @@ if run_analysis:
     
     optimal_row = results_df[results_df['Range Width (±%)'] == optimal_width_pct].iloc[0]
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric("Optimal Range Width", f"±{optimal_width_pct:.2f}%")
@@ -874,6 +950,9 @@ if run_analysis:
     
     with col3:
         st.metric("Projected Daily Return", f"{optimal_row['Net Return (%)']:.2f}%")
+        
+    with col4:
+        st.metric("Expected Rebalances", f"{optimal_row['Expected Daily Rebalances']:.1f}/day")
     
     # Display lower and upper price bounds
     current_price = price_data['price'].iloc[-1]
